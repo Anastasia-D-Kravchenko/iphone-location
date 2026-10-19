@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone Location</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
+    --line: #e2e2e0; --accent: #0a66d8; --accent-text: #fff;
+    --ok: #1f8a4c; --err: #c4321f; --chip: #f0f0ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161617; --panel: #1f1f21; --text: #f2f2f2; --muted: #9a9aa0;
+      --line: #333336; --accent: #3d8bff; --accent-text: #fff;
+      --ok: #4cc27f; --err: #ff6b57; --chip: #2a2a2d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; display: flex; }
+  #side { width: 340px; flex: none; background: var(--panel); border-right: 1px solid var(--line); padding: 18px 16px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; }
+  #side > * { flex-shrink: 0; }
+  #map { flex: 1; }
+  h1 { font-size: 19px; margin: 0; }
+  label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; display: block; margin-bottom: 5px; }
+  select, input { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+  .row { display: flex; gap: 8px; }
+  button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--chip); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; flex: 1; }
+  button:disabled { opacity: .5; cursor: default; }
+  #coords { font-variant-numeric: tabular-nums; font-size: 14px; color: var(--muted); }
+  #status { font-size: 14px; padding: 10px 12px; border-radius: 8px; background: var(--chip); min-height: 20px; }
+  #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+  #results button, .places button { display: block; width: 100%; text-align: left; margin-bottom: 6px; font-size: 14px; }
+  .places { display: flex; flex-direction: column; }
+  .place { display: flex; gap: 6px; }
+  .place button:first-child { flex: 1; }
+  .place button:last-child { width: auto; flex: none; }
+  .hint { font-size: 13px; color: var(--muted); }
+  @media (max-width: 760px) {
+    body { flex-direction: column; }
+    #side { width: 100%; border-right: none; border-bottom: 1px solid var(--line); max-height: 55vh; }
+    #map { min-height: 45vh; }
+  }
+</style>
+</head>
+<body>
+<aside id="side">
+  <h1>iPhone Location</h1>
+
+  <div>
+    <label for="device">Device</label>
+    <div class="row">
+      <select id="device"><option>Looking for iPhones…</option></select>
+      <button id="refresh" title="Refresh list" style="flex:none">↻</button>
+    </div>
+  </div>
+
+  <div>
+    <label for="q">Search a place</label>
+    <form id="search" class="row">
+      <input id="q" placeholder="e.g. Eiffel Tower, Paris" autocomplete="off">
+      <button type="submit" style="flex:none">Find</button>
+    </form>
+    <div id="results" style="margin-top:8px"></div>
+  </div>
+
+  <div>
+    <label>Chosen point</label>
+    <div id="coords">Click anywhere on the map</div>
+  </div>
+
+  <div class="row">
+    <button id="set" class="primary" disabled>Move iPhone here</button>
+    <button id="save" disabled title="Save to my places">★</button>
+  </div>
+  <button id="clear">Original location</button>
+  <div id="status">Ready.</div>
+
+  <div>
+    <label>My places</label>
+    <div id="places" class="places"></div>
+  </div>
+
+  <p class="hint">The fake location stays until you press “Original location”, unplug for a long time, or restart the iPhone. It needs Developer Mode on and the iPhone connected to this Mac.</p>
+</aside>
+<div id="map"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const DEFAULT_PLACES = [
+  { name: "Kyiv, Maidan", lat: 50.4501, lon: 30.5234 },
+  { name: "Warsaw, Old Town", lat: 52.2497, lon: 21.0122 },
+  { name: "Paris, Eiffel Tower", lat: 48.8584, lon: 2.2945 },
+  { name: "New York, Times Square", lat: 40.7580, lon: -73.9855 },
+  { name: "Tokyo, Shibuya", lat: 35.6595, lon: 139.7005 },
+];
+
+let chosen = null;
+let fakeMarker = null;
+
+const map = L.map("map").setView([50.45, 30.52], 5);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+const pick = L.marker([0, 0], { opacity: 0.85 });
+
+function status(text, kind) {
+  $("status").textContent = text;
+  $("status").className = kind || "";
+}
+
+function choose(lat, lon, label) {
+  chosen = { lat, lon, name: label || `${lat.toFixed(5)}, ${lon.toFixed(5)}` };
+  pick.setLatLng([lat, lon]).addTo(map);
+  $("coords").textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)}` + (label ? ` · ${label}` : "");
+  $("set").disabled = false;
+  $("save").disabled = false;
+}
+
+map.on("click", e => choose(e.latlng.lat, e.latlng.lng));
+
+async function loadDevices() {
+  $("device").innerHTML = "<option>Looking for iPhones…</option>";
+  try {
+    const r = await fetch("/api/devices").then(r => r.json());
+    if (!r.devices.length) {
+      $("device").innerHTML = "<option value=''>No iPhone found, plug it in</option>";
+      return;
+    }
+    r.devices = r.devices.filter(d => d.movable !== false);
+    $("device").innerHTML = r.devices
+      .map(d => `<option value="${d.id}">${d.kind === "watch" ? "⌚" : "📱"} ${d.name}${d.paired ? "" : " (not paired)"}</option>`)
+      .join("") + (r.devices.length > 1 ? `<option value="all">All devices</option>` : "");
+    window.allDevices = r.devices.map(d => d.id);
+  } catch {
+    $("device").innerHTML = "<option value=''>Server not running</option>";
+  }
+}
+
+async function postOne(path, device, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device, ...body }),
+  });
+  return r.json();
+}
+
+async function post(path, body) {
+  const v = $("device").value;
+  const ids = v === "all" ? (window.allDevices || []) : [v];
+  const replies = await Promise.all(ids.map(id => postOne(path, id, body)));
+  const bad = replies.filter(r => !r.ok);
+  return bad.length ? { ok: false, error: bad.map(r => r.error).join(" · ") } : { ok: true };
+}
+
+$("set").onclick = async () => {
+  if (!chosen) return;
+  $("set").disabled = true;
+  status("Moving iPhone…");
+  const r = await post("/api/set", { lat: chosen.lat, lon: chosen.lon }).catch(() => ({ ok: false, error: "Server not running" }));
+  $("set").disabled = false;
+  if (r.ok) {
+    status(`Moved to ${chosen.name}`, "ok");
+    if (fakeMarker) fakeMarker.remove();
+    fakeMarker = L.circleMarker([chosen.lat, chosen.lon], { radius: 9, color: "#0a66d8", fillOpacity: 0.6 }).addTo(map);
+  } else {
+    status(r.error, "err");
+  }
+};
+
+$("clear").onclick = async () => {
+  status("Restoring real location…");
+  const r = await post("/api/clear", {}).catch(() => ({ ok: false, error: "Server not running" }));
+  if (r.ok) {
+    status("Back to the real location.", "ok");
+    if (fakeMarker) { fakeMarker.remove(); fakeMarker = null; }
+  } else {
+    status(r.error, "err");
+  }
+};
+
+$("search").onsubmit = async e => {
+  e.preventDefault();
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("results").innerHTML = "<span class='hint'>Searching…</span>";
+  try {
+    const url = "https://nominatim.openstreetmap.org/search?format=json&limit=5&q=" + encodeURIComponent(q);
+    const list = await fetch(url).then(r => r.json());
+    $("results").innerHTML = "";
+    if (!list.length) { $("results").innerHTML = "<span class='hint'>Nothing found</span>"; return; }
+    for (const p of list) {
+      const b = document.createElement("button");
+      b.textContent = p.display_name;
+      b.onclick = () => {
+        const lat = +p.lat, lon = +p.lon;
+        choose(lat, lon, p.display_name.split(",").slice(0, 2).join(","));
+        map.setView([lat, lon], 15);
+        $("results").innerHTML = "";
+      };
+      $("results").appendChild(b);
+    }
+  } catch {
+    $("results").innerHTML = "<span class='hint'>Search failed (no internet?)</span>";
+  }
+};
+
+function getPlaces() {
+  try { return JSON.parse(localStorage.getItem("places")) || DEFAULT_PLACES; } catch { return DEFAULT_PLACES; }
+}
+function setPlaces(list) {
+  try { localStorage.setItem("places", JSON.stringify(list)); } catch {}
+  renderPlaces();
+}
+function renderPlaces() {
+  const box = $("places");
+  box.innerHTML = "";
+  getPlaces().forEach((p, i) => {
+    const row = document.createElement("div");
+    row.className = "place";
+    const go = document.createElement("button");
+    go.textContent = p.name;
+    go.onclick = () => { choose(p.lat, p.lon, p.name); map.setView([p.lat, p.lon], 15); };
+    const del = document.createElement("button");
+    del.textContent = "✕";
+    del.title = "Remove";
+    del.onclick = () => setPlaces(getPlaces().filter((_, j) => j !== i));
+    row.append(go, del);
+    box.appendChild(row);
+  });
+}
+
+$("save").onclick = () => {
+  if (!chosen) return;
+  const name = prompt("Name for this place:", chosen.name);
+  if (name) setPlaces([...getPlaces(), { name, lat: chosen.lat, lon: chosen.lon }]);
+};
+$("refresh").onclick = loadDevices;
+
+renderPlaces();
+loadDevices();
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Personal / secret — never commit
+.token
+ios/local.env
+ios/LocationRemote/Config.swift
+.holds.json
+*.mobileprovision
+*.plist.bak
+
+# Logs and caches
+*.log
+__pycache__/
+.DS_Store
+
+# Generated (xcodegen / build_install.sh / build_idevice.sh)
+ios/build/
+ios/LocationRemote.xcodeproj/
+ios/LocationRemote/Info.plist
+ios/Vendor/idevice/libidevice_ffi.a
+ios/Vendor/idevice/idevice.h
+ios/Vendor/idevice_backup_*/
+
+# Local copy of the Locus project (upstream: github.com/ChrisMack32/Locus)
+locus/
+NOTES.local.md

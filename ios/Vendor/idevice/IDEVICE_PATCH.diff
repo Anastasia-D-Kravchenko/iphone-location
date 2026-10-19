@@ -1,0 +1,571 @@
+diff --git a/ffi/src/pairable_host.rs b/ffi/src/pairable_host.rs
+index 534ffc7..27f352a 100644
+--- a/ffi/src/pairable_host.rs
++++ b/ffi/src/pairable_host.rs
+@@ -325,3 +325,121 @@ pub unsafe extern "C" fn pairable_host_accept_with_options(
+         Err(e) => ffi_err!(e),
+     }
+ }
++
++/// Called once the TCP listener is bound and ready. The host app should publish
++/// `_remotepairing-pairable-host._tcp` via Bonjour (Network.framework) using these values.
++pub type PairableHostListeningCallback = Option<extern "C" fn(
++    port: u16,
++    service_identifier: *const c_char,
++    name: *const c_char,
++    model: *const c_char,
++    auth_tag: *const c_char,
++    ver: *const c_char,
++    min_ver: *const c_char,
++    context: *mut c_void,
++)>;
++
++/// Called when a device TCP connection is accepted (before PIN generation).
++pub type PairableHostConnectedCallback = Option<extern "C" fn(context: *mut c_void)>;
++
++/// Like `pairable_host_accept`, but does NOT advertise over mDNS itself. Instead
++/// `listening_callback` receives the port and TXT values so an iOS app can advertise
++/// with Network.framework (Rust raw multicast needs an entitlement on iOS).
++/// `listening_callback` / `connected_callback` may be NULL. Blocks until pairing ends.
++///
++/// # Safety
++/// `name` must be a valid C string, `model` NULL or a valid C string,
++/// `out_host_alt_irk` NULL or 16 writable bytes, `out_pairing_file` valid and non-null.
++#[unsafe(no_mangle)]
++#[allow(clippy::too_many_arguments)]
++pub unsafe extern "C" fn pairable_host_accept_ext(
++    name: *const c_char,
++    model: *const c_char,
++    port: u16,
++    pin_callback: Option<extern "C" fn(pin: *const c_char, context: *mut c_void)>,
++    pin_context: *mut c_void,
++    listening_callback: PairableHostListeningCallback,
++    listening_context: *mut c_void,
++    connected_callback: PairableHostConnectedCallback,
++    connected_context: *mut c_void,
++    out_host_alt_irk: *mut u8,
++    out_pairing_file: *mut *mut RpPairingFileHandle,
++) -> *mut IdeviceFfiError {
++    if name.is_null() || out_pairing_file.is_null() {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++    let name = match unsafe { CStr::from_ptr(name) }.to_str() {
++        Ok(s) => s.to_string(),
++        Err(_) => return ffi_err!(IdeviceError::FfiInvalidString),
++    };
++    let model = if model.is_null() {
++        "Mac17,7".to_string()
++    } else {
++        match unsafe { CStr::from_ptr(model) }.to_str() {
++            Ok(s) => s.to_string(),
++            Err(_) => return ffi_err!(IdeviceError::FfiInvalidString),
++        }
++    };
++
++    let pin_ctx = PinCtx(pin_context);
++    let listen_ctx = PinCtx(listening_context);
++    let conn_ctx = PinCtx(connected_context);
++
++    let res = run_sync_local(async move {
++        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
++            .await
++            .map_err(|e| IdeviceError::InternalError(format!("bind: {e}")))?;
++        let port = listener
++            .local_addr()
++            .map_err(|e| IdeviceError::InternalError(format!("{e}")))?
++            .port();
++
++        let mut pairing_file = RpPairingFile::generate(&name);
++        let host_info = PairableHostInfo::generate(&name, &model);
++        let host_alt_irk = host_info.alt_irk;
++        let service_identifier = pairing_file.identifier.clone();
++
++        if let Some(cb) = listening_callback {
++            let txt: std::collections::HashMap<String, String> =
++                host_info.mdns_txt_records(&service_identifier).into_iter().collect();
++            let field = |k: &str| CString::new(txt.get(k).cloned().unwrap_or_default()).unwrap_or_default();
++            let (sid, n, m, a, v, mv) = (
++                field("identifier"), field("name"), field("model"),
++                field("authTag"), field("ver"), field("minVer"),
++            );
++            cb(port, sid.as_ptr(), n.as_ptr(), m.as_ptr(), a.as_ptr(), v.as_ptr(), mv.as_ptr(), listen_ctx.0);
++        }
++
++        let (stream, _peer) = listener
++            .accept()
++            .await
++            .map_err(|e| IdeviceError::InternalError(format!("accept: {e}")))?;
++        if let Some(cb) = connected_callback {
++            cb(conn_ctx.0);
++        }
++
++        let socket = RpPairingSocket::new_device(stream);
++        let mut host = PairableHost::new(socket, host_info);
++        host.accept(&mut pairing_file, |pin| async move {
++            if let Some(cb) = pin_callback
++                && let Ok(cpin) = CString::new(pin)
++            {
++                cb(cpin.as_ptr(), pin_ctx.0);
++            }
++        })
++        .await?;
++
++        Ok::<_, IdeviceError>((pairing_file, host_alt_irk))
++    });
++
++    match res {
++        Ok((rpf, host_alt_irk)) => {
++            if !out_host_alt_irk.is_null() {
++                unsafe { std::ptr::copy_nonoverlapping(host_alt_irk.as_ptr(), out_host_alt_irk, 16) };
++            }
++            unsafe { *out_pairing_file = Box::into_raw(Box::new(RpPairingFileHandle(rpf))) };
++            null_mut()
++        }
++        Err(e) => ffi_err!(e),
++    }
++}
+diff --git a/ffi/src/tunnel_provider.rs b/ffi/src/tunnel_provider.rs
+index 58dd1f8..3a0af7e 100644
+--- a/ffi/src/tunnel_provider.rs
++++ b/ffi/src/tunnel_provider.rs
+@@ -434,3 +434,401 @@ fn get_pin(cb: Option<extern "C" fn(*mut c_void) -> *const c_char>, ctx: &PinCtx
+     }
+     "000000".to_string()
+ }
++
++/// Connections that must stay open while a companion (Apple Watch) tunnel is used:
++/// the companion-proxy forwards and the RPPairing control connection.
++#[cfg(feature = "companion_proxy")]
++static COMPANION_KEEP: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> =
++    std::sync::Mutex::new(Vec::new());
++
++/// Creates a tunnel to the iPhone's paired Apple Watch through an existing iPhone tunnel,
++/// the way Xcode does it: the iPhone's companion proxy forwards the Watch's RemotePairing
++/// port, RPPairing runs over that forward, the Watch's tunnel listener is forwarded too,
++/// and TLS-PSK + CDTunnel run over the second forward.
++///
++/// `watch_remote_port` is the RemotePairing port on the Watch (49152).
++/// Call `tunnel_companion_release` after freeing the returned adapter.
++///
++/// # Safety
++/// All pointer arguments must be valid and non-null (except `pin_callback`/`pin_context`).
++#[cfg(feature = "companion_proxy")]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tunnel_create_rppairing_companion(
++    phone_adapter: *mut AdapterHandle,
++    phone_handshake: *mut RsdHandshakeHandle,
++    watch_remote_port: u16,
++    hostname: *const c_char,
++    pairing_file: *mut RpPairingFileHandle,
++    pin_callback: Option<extern "C" fn(context: *mut c_void) -> *const c_char>,
++    pin_context: *mut c_void,
++    out_adapter: *mut *mut AdapterHandle,
++    out_handshake: *mut *mut RsdHandshakeHandle,
++) -> *mut IdeviceFfiError {
++    use idevice::RsdService as _;
++    use idevice::companion_proxy::CompanionProxy;
++    use idevice::provider::RsdProvider as _;
++    use idevice::remote_pairing::connect_tls_psk_tunnel_native;
++
++    if phone_adapter.is_null()
++        || phone_handshake.is_null()
++        || hostname.is_null()
++        || pairing_file.is_null()
++        || out_adapter.is_null()
++        || out_handshake.is_null()
++    {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++    let host = match unsafe { CStr::from_ptr(hostname) }.to_str() {
++        Ok(s) => s.to_string(),
++        Err(_) => return ffi_err!(IdeviceError::FfiInvalidString),
++    };
++    let rpf = unsafe { &mut (*pairing_file).0 };
++    let ctx = PinCtx(pin_context);
++    let phone = unsafe { &mut (*phone_adapter).0 };
++    let hs = unsafe { &mut (*phone_handshake).0 };
++
++    async fn timed<T>(
++        name: &'static str,
++        secs: u64,
++        fut: impl std::future::Future<Output = Result<T, IdeviceError>>,
++    ) -> Result<T, IdeviceError> {
++        tracing::info!("companion: {name}...");
++        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
++            Ok(Ok(v)) => {
++                tracing::info!("companion: {name} ok");
++                Ok(v)
++            }
++            Ok(Err(e)) => {
++                tracing::warn!("companion: {name} failed: {e}");
++                Err(IdeviceError::InternalError(format!("{name}: {e}")))
++            }
++            Err(_) => {
++                tracing::warn!("companion: {name} timed out");
++                Err(IdeviceError::InternalError(format!("{name}: no answer in {secs} s")))
++            }
++        }
++    }
++
++    let res = run_sync_local(async {
++        let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
++
++        let mut cp1 = timed("companion proxy", 20, CompanionProxy::connect_rsd(phone, hs)).await?;
++        let fwd1 = timed("forward pairing port", 20, cp1
++            .start_forwarding_service_port(watch_remote_port, None, None)).await?;
++        keep.push(Box::new(cp1));
++
++        let s1 = timed("connect forwarded pairing port", 20, phone
++            .connect_to_service_port(fwd1)).await?;
++        let mut rpc = RemotePairingClient::new(RpPairingSocket::new(s1), &host);
++        timed("Watch pairing", 120, rpc.connect(rpf, async || get_pin(pin_callback, &ctx))).await?;
++        let tunnel_port = timed("Watch tunnel listener", 20, rpc
++            .create_tcp_listener()).await?;
++        let key = rpc.encryption_key().to_vec();
++
++        let mut cp2 = timed("companion proxy (2)", 20, CompanionProxy::connect_rsd(phone, hs)).await?;
++        let fwd2 = timed("forward tunnel port", 20, cp2
++            .start_forwarding_service_port(tunnel_port, None, None)).await?;
++        keep.push(Box::new(cp2));
++
++        let s2 = timed("connect forwarded tunnel port", 20, phone
++            .connect_to_service_port(fwd2)).await?;
++        let tunnel = timed("Watch TLS tunnel", 20, connect_tls_psk_tunnel_native(s2, &key)).await?;
++        keep.push(Box::new(rpc));
++
++        let client_ip: std::net::IpAddr = tunnel
++            .info
++            .client_address
++            .parse()
++            .map_err(|e| IdeviceError::InternalError(format!("{e}")))?;
++        let server_ip: std::net::IpAddr = tunnel
++            .info
++            .server_address
++            .parse()
++            .map_err(|e| IdeviceError::InternalError(format!("{e}")))?;
++        let mtu = tunnel.info.mtu as usize;
++        let rsd_port = tunnel.info.server_rsd_port;
++
++        let raw = tunnel.into_inner();
++        let mut adapter = idevice::tcp::adapter::Adapter::new(Box::new(raw), client_ip, server_ip);
++        adapter.set_mss(mtu.saturating_sub(60));
++        let mut adapter = adapter.to_async_handle();
++        let rsd_stream = adapter
++            .connect(rsd_port)
++            .await
++            .map_err(|e| IdeviceError::InternalError(format!("Watch RSD: {e}")))?;
++        tracing::info!("companion: Watch RSD stream ok");
++        let handshake = timed("Watch RSD handshake", 20, RsdHandshake::new(rsd_stream)).await?;
++
++        if let Ok(mut k) = COMPANION_KEEP.lock() {
++            k.extend(keep);
++        }
++        Ok::<_, IdeviceError>((adapter, handshake))
++    });
++
++    match res {
++        Ok((adapter, handshake)) => {
++            write_result(adapter, handshake, out_adapter, out_handshake);
++            null_mut()
++        }
++        Err(e) => ffi_err!(e),
++    }
++}
++
++/// Closes the connections kept open by `tunnel_create_rppairing_companion`.
++#[cfg(feature = "companion_proxy")]
++#[unsafe(no_mangle)]
++pub extern "C" fn tunnel_companion_release() {
++    if let Ok(mut k) = COMPANION_KEEP.lock() {
++        k.clear();
++    }
++}
++
++/// Experiment (Apple Watch over Bluetooth): pair-verify on a control channel reachable at
++/// `addr` (a local relay of the Watch's L2CAP PSM 0x85), then send `createListener` and
++/// return the Watch's raw answer as text in `out_text` (free with `idevice_string_free`).
++///
++/// # Safety
++/// Pointer arguments must be valid; `pin_callback`/`pin_context` may be NULL.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rppairing_bringup_probe(
++    addr: *const idevice_sockaddr,
++    addr_len: idevice_socklen_t,
++    hostname: *const c_char,
++    pairing_file: *mut RpPairingFileHandle,
++    pin_callback: Option<extern "C" fn(context: *mut c_void) -> *const c_char>,
++    pin_context: *mut c_void,
++    out_text: *mut *mut c_char,
++) -> *mut IdeviceFfiError {
++    if addr.is_null() || hostname.is_null() || pairing_file.is_null() || out_text.is_null() {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++    let socket_addr = match crate::util::c_socket_to_rust(addr as *const SockAddr, addr_len) {
++        Ok(a) => a,
++        Err(e) => return ffi_err!(e),
++    };
++    let host = match unsafe { CStr::from_ptr(hostname) }.to_str() {
++        Ok(s) => s.to_string(),
++        Err(_) => return ffi_err!(IdeviceError::FfiInvalidString),
++    };
++    let rpf = unsafe { &mut (*pairing_file).0 };
++    let ctx = PinCtx(pin_context);
++
++    let res = run_sync_local(async {
++        let stream = run_global_timeout(|| tokio::net::TcpStream::connect(socket_addr))
++            .await
++            .map_err(|e| IdeviceError::InternalError(format!("connect: {e}")))?;
++        let mut rpc = RemotePairingClient::new(RpPairingSocket::new(stream), &host);
++        tokio::time::timeout(
++            std::time::Duration::from_secs(60),
++            rpc.connect(rpf, async || get_pin(pin_callback, &ctx)),
++        )
++        .await
++        .map_err(|_| IdeviceError::InternalError("pairing: no answer".into()))??;
++        let text = match tokio::time::timeout(
++            std::time::Duration::from_secs(20),
++            rpc.create_tcp_listener(),
++        )
++        .await
++        {
++            Ok(Ok(port)) => format!("createListener port {port}"),
++            Ok(Err(e)) => format!("createListener error: {e}"),
++            Err(_) => "createListener: no answer in 20 s".to_string(),
++        };
++        Ok::<_, IdeviceError>(text)
++    });
++    match res {
++        Ok(text) => {
++            let c = std::ffi::CString::new(text).unwrap_or_default();
++            unsafe { *out_text = c.into_raw() };
++            null_mut()
++        }
++        Err(e) => ffi_err!(e),
++    }
++}
++
++/// Called with the Watch's tunnel listener port; fills `out_addr` (up to `cap` bytes of
++/// sockaddr_in / sockaddr_in6 for that port) and returns its length, or 0 if not found.
++/// RemotePairing control session of the current Watch tunnel. The Watch drops the tunnel
++/// (goes silent after ~8 s) once the session that asked for it ends, so it is kept open.
++static WATCH_CONTROL: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> = std::sync::Mutex::new(None);
++
++/// Ends the kept Watch control session (call after freeing the Watch adapter).
++#[unsafe(no_mangle)]
++pub extern "C" fn tunnel_ble_release() {
++    if let Ok(mut k) = WATCH_CONTROL.lock() {
++        *k = None;
++    }
++}
++
++pub type WatchResolveCallback = Option<
++    extern "C" fn(port: u16, context: *mut c_void, out_addr: *mut u8, cap: usize) -> usize,
++>;
++
++/// Creates a tunnel to an Apple Watch the way a Mac does over Bluetooth: RemotePairing on the
++/// control channel at `control_addr` (a local relay of the Watch's L2CAP PSM 0x85), then
++/// `createListener`; `resolve_callback` finds the Watch's address for that port (Bonjour
++/// `_rp-tunnel._tcp`), and the TLS-PSK tunnel runs over TCP to it.
++///
++/// # Safety
++/// Pointer arguments must be valid; pin and resolve contexts are passed through.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tunnel_create_rppairing_ble(
++    control_addr: *const idevice_sockaddr,
++    control_len: idevice_socklen_t,
++    hostname: *const c_char,
++    pairing_file: *mut RpPairingFileHandle,
++    pin_callback: Option<extern "C" fn(context: *mut c_void) -> *const c_char>,
++    pin_context: *mut c_void,
++    resolve_callback: WatchResolveCallback,
++    resolve_context: *mut c_void,
++    out_adapter: *mut *mut AdapterHandle,
++    out_handshake: *mut *mut RsdHandshakeHandle,
++) -> *mut IdeviceFfiError {
++    use idevice::remote_pairing::connect_tls_psk_tunnel_native;
++    if control_addr.is_null()
++        || hostname.is_null()
++        || pairing_file.is_null()
++        || resolve_callback.is_none()
++        || out_adapter.is_null()
++        || out_handshake.is_null()
++    {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++    let socket_addr = match crate::util::c_socket_to_rust(control_addr as *const SockAddr, control_len) {
++        Ok(a) => a,
++        Err(e) => return ffi_err!(e),
++    };
++    let host = match unsafe { CStr::from_ptr(hostname) }.to_str() {
++        Ok(s) => s.to_string(),
++        Err(_) => return ffi_err!(IdeviceError::FfiInvalidString),
++    };
++    let rpf = unsafe { &mut (*pairing_file).0 };
++    let ctx = PinCtx(pin_context);
++    let rctx = PinCtx(resolve_context);
++    let resolve = resolve_callback.unwrap();
++
++    fn err(step: &str, e: impl std::fmt::Display) -> IdeviceError {
++        IdeviceError::InternalError(format!("{step}: {e}"))
++    }
++
++    let res = run_sync_local(async {
++        let secs = std::time::Duration::from_secs;
++        let stream = run_global_timeout(|| tokio::net::TcpStream::connect(socket_addr))
++            .await
++            .map_err(|e| err("control channel", e))?;
++        let mut rpc = RemotePairingClient::new(RpPairingSocket::new(stream), &host);
++        tokio::time::timeout(secs(90), rpc.connect(rpf, async || get_pin(pin_callback, &ctx)))
++            .await
++            .map_err(|_| err("Watch pairing", "no answer"))?
++            .map_err(|e| err("Watch pairing", e))?;
++        let port = tokio::time::timeout(secs(20), rpc.create_tcp_listener())
++            .await
++            .map_err(|_| err("tunnel listener", "no answer"))?
++            .map_err(|e| err("tunnel listener", e))?;
++        tracing::info!("watch: tunnel listener on port {port}");
++
++        // Ask the app where the Watch is (blocking Bonjour lookup on its side).
++        let mut buf = [0u8; 128];
++        let n = tokio::task::block_in_place(|| resolve(port, rctx.0, buf.as_mut_ptr(), buf.len()));
++        if n == 0 {
++            return Err(err("find Watch", format!("_rp-tunnel._tcp with port {port} not found")));
++        }
++        let watch_addr = crate::util::c_socket_to_rust(buf.as_ptr() as *const SockAddr, n as _)
++            .map_err(|e| err("Watch address", e))?;
++        tracing::info!("watch: connecting tunnel to {watch_addr}");
++
++        let tcp = tokio::time::timeout(secs(15), tokio::net::TcpStream::connect(watch_addr))
++            .await
++            .map_err(|_| err("connect Watch tunnel", format!("{watch_addr}: no answer")))?
++            .map_err(|e| err("connect Watch tunnel", format!("{watch_addr}: {e}")))?;
++        let tunnel = tokio::time::timeout(secs(20), connect_tls_psk_tunnel_native(tcp, rpc.encryption_key()))
++            .await
++            .map_err(|_| err("Watch TLS", "no answer"))?
++            .map_err(|e| err("Watch TLS", e))?;
++
++        let client_ip: std::net::IpAddr = tunnel.info.client_address.parse().map_err(|e| err("tunnel ip", e))?;
++        let server_ip: std::net::IpAddr = tunnel.info.server_address.parse().map_err(|e| err("tunnel ip", e))?;
++        let mtu = tunnel.info.mtu as usize;
++        let rsd_port = tunnel.info.server_rsd_port;
++        let raw = tunnel.into_inner();
++        let mut adapter = idevice::tcp::adapter::Adapter::new(Box::new(raw), client_ip, server_ip);
++        adapter.set_mss(mtu.saturating_sub(60));
++        let mut adapter = adapter.to_async_handle();
++        let rsd_stream = adapter.connect(rsd_port).await.map_err(|e| err("Watch RSD", e))?;
++        let handshake = tokio::time::timeout(secs(20), RsdHandshake::new(rsd_stream))
++            .await
++            .map_err(|_| err("Watch RSD", "no answer"))?
++            .map_err(|e| err("Watch RSD", e))?;
++        if let Ok(mut k) = WATCH_CONTROL.lock() {
++            *k = Some(Box::new(rpc));
++        }
++        Ok::<_, IdeviceError>((adapter, handshake))
++    });
++
++    match res {
++        Ok((adapter, handshake)) => {
++            write_result(adapter, handshake, out_adapter, out_handshake);
++            null_mut()
++        }
++        Err(e) => ffi_err!(e),
++    }
++}
++
++/// Sets a simulated location through CoreDevice's location service (dtlocationd), like
++/// `devicectl device simulate location coordinate`. It stays after the tunnel closes.
++///
++/// # Safety
++/// `adapter` and `handshake` must be valid handles from this library.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn coredevice_location_set(
++    adapter: *mut AdapterHandle,
++    handshake: *mut RsdHandshakeHandle,
++    latitude: f64,
++    longitude: f64,
++) -> *mut IdeviceFfiError {
++    use idevice::RsdService as _;
++    if adapter.is_null() || handshake.is_null() {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++    let res = run_sync_local(async {
++        let a = unsafe { &mut (*adapter).0 };
++        let h = unsafe { &mut (*handshake).0 };
++        let mut c = idevice::core_device::LocationServiceClient::connect_rsd(a, h).await?;
++        tokio::time::timeout(std::time::Duration::from_secs(20), c.set_simulated_location(latitude, longitude))
++            .await
++            .map_err(|_| IdeviceError::InternalError("set location: no answer".into()))??;
++        Ok::<_, IdeviceError>(())
++    });
++    match res {
++        Ok(()) => null_mut(),
++        Err(e) => ffi_err!(e),
++    }
++}
++
++/// Clears the location set by `coredevice_location_set`.
++///
++/// # Safety
++/// `adapter` and `handshake` must be valid handles from this library.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn coredevice_location_clear(
++    adapter: *mut AdapterHandle,
++    handshake: *mut RsdHandshakeHandle,
++) -> *mut IdeviceFfiError {
++    use idevice::RsdService as _;
++    if adapter.is_null() || handshake.is_null() {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++    let res = run_sync_local(async {
++        let a = unsafe { &mut (*adapter).0 };
++        let h = unsafe { &mut (*handshake).0 };
++        let mut c = idevice::core_device::LocationServiceClient::connect_rsd(a, h).await?;
++        tokio::time::timeout(std::time::Duration::from_secs(20), c.clear_simulated_location())
++            .await
++            .map_err(|_| IdeviceError::InternalError("clear location: no answer".into()))??;
++        Ok::<_, IdeviceError>(())
++    });
++    match res {
++        Ok(()) => null_mut(),
++        Err(e) => ffi_err!(e),
++    }
++}
+diff --git a/idevice/src/services/core_device/location_service.rs b/idevice/src/services/core_device/location_service.rs
+index a0d066a..fb0d64d 100644
+--- a/idevice/src/services/core_device/location_service.rs
++++ b/idevice/src/services/core_device/location_service.rs
+@@ -59,4 +59,34 @@ impl<R: ReadWrite> LocationServiceClient<R> {
+         plist::from_value(scenarios)
+             .map_err(|_| CoreDeviceError::MalformedField("scenarios").into())
+     }
++
++    /// Set a simulated location (CoreDevice / dtlocationd). Unlike DVT location simulation it
++    /// stays on the device after the connection closes, until cleared.
++    pub async fn set_simulated_location(
++        &mut self,
++        latitude: f64,
++        longitude: f64,
++    ) -> Result<plist::Value, IdeviceError> {
++        let mut input = plist::Dictionary::new();
++        input.insert("latitude".into(), plist::Value::Real(latitude));
++        input.insert("longitude".into(), plist::Value::Real(longitude));
++        self.inner
++            .invoke_with_plist_action(
++                obf!("com.apple.coredevice.feature.simulatelocation"),
++                input,
++                obf!("com.apple.coredevice.action.setsimulatedlocation"),
++            )
++            .await
++    }
++
++    /// Clear the simulated location set by `set_simulated_location`.
++    pub async fn clear_simulated_location(&mut self) -> Result<plist::Value, IdeviceError> {
++        self.inner
++            .invoke_with_plist_action(
++                obf!("com.apple.coredevice.feature.simulatelocation"),
++                plist::Dictionary::new(),
++                obf!("com.apple.coredevice.action.clearsimulatedlocation"),
++            )
++            .await
++    }
+ }

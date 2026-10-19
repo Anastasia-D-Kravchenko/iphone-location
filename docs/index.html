@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone Location</title>
+<meta name="description" content="Move the location of your own iPhone and Apple Watch — from a Mac or with no Mac at all. Open source, MIT.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4C21 4 12 13 12 24c0 15 20 36 20 36s20-21 20-36C52 13 43 4 32 4z' fill='%23ff5a4e'/%3E%3Ccircle cx='32' cy='24' r='8' fill='white'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbfaf8; --surface: #ffffff; --ink: #1b1d22; --muted: #5f6470; --line: #e6e3de;
+    --accent: #e8483c; --accent-ink: #ffffff; --code: #f3f1ed; --ok: #1f8a5b; --warn-bg: #fff4e5; --warn: #8a5300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121316; --surface: #1b1d22; --ink: #eceae6; --muted: #a4a7b0; --line: #2c2f36;
+      --accent: #ff6a5c; --accent-ink: #1b1d22; --code: #23262c; --ok: #4fd08f; --warn-bg: #2d2416; --warn: #f2b45c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121316; --surface: #1b1d22; --ink: #eceae6; --muted: #a4a7b0; --line: #2c2f36;
+    --accent: #ff6a5c; --accent-ink: #1b1d22; --code: #23262c; --ok: #4fd08f; --warn-bg: #2d2416; --warn: #f2b45c;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+  header.top { display: flex; justify-content: space-between; align-items: center; padding: 18px 0; }
+  .brand { display: flex; gap: 10px; align-items: center; font-weight: 700; letter-spacing: -0.01em; white-space: nowrap; }
+  nav { display: flex; align-items: center; white-space: nowrap; }
+  .brand svg { width: 26px; height: 26px; }
+  nav a { color: var(--muted); text-decoration: none; margin-left: 18px; font-size: 15px; }
+  nav a:hover { color: var(--ink); }
+  .hero { padding: 56px 0 40px; display: grid; grid-template-columns: 1.2fr 1fr; gap: 40px; align-items: center; }
+  h1 { font-size: clamp(34px, 6vw, 56px); line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 18px; }
+  .lead { color: var(--muted); font-size: 19px; margin: 0 0 26px; }
+  .btns { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn { display: inline-block; padding: 11px 18px; border-radius: 12px; text-decoration: none; font-weight: 600; font-size: 15px; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); }
+  .btn.ghost { border: 1px solid var(--line); color: var(--ink); background: var(--surface); }
+  .devices { position: relative; height: 300px; }
+  .phone { position: absolute; left: 8%; top: 0; width: 160px; height: 300px; border-radius: 34px; background: var(--surface);
+    border: 1px solid var(--line); box-shadow: 0 20px 50px rgba(0,0,0,.12); overflow: hidden; }
+  .map { position: absolute; inset: 10px; border-radius: 26px; background:
+    linear-gradient(90deg, transparent 47%, var(--line) 47% 53%, transparent 53%),
+    linear-gradient(0deg, transparent 60%, var(--line) 60% 64%, transparent 64%),
+    linear-gradient(35deg, transparent 30%, var(--line) 30% 33%, transparent 33%),
+    var(--code); }
+  .pin { position: absolute; width: 34px; height: 34px; left: 50%; top: 42%; transform: translate(-50%,-100%); }
+  .watch { position: absolute; right: 8%; top: 70px; width: 120px; height: 140px; border-radius: 34px; background: var(--surface);
+    border: 1px solid var(--line); box-shadow: 0 20px 50px rgba(0,0,0,.12); display: grid; place-items: center; }
+  .watch .map { inset: 8px; border-radius: 26px; }
+  .link { position: absolute; left: 44%; top: 140px; width: 18%; border-top: 2px dashed var(--accent); }
+  section { padding: 36px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 18px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--ok); margin-bottom: 8px; text-transform: uppercase; letter-spacing: .04em; }
+  ol.flow { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; counter-reset: s; }
+  ol.flow li { counter-increment: s; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px 12px 52px; position: relative; }
+  ol.flow li::before { content: counter(s); position: absolute; left: 14px; top: 12px; width: 26px; height: 26px; border-radius: 50%;
+    background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 14px; display: grid; place-items: center; }
+  code, pre { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 6px; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; overflow-x: auto; margin: 0; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .note { background: var(--warn-bg); color: var(--warn); border-radius: 14px; padding: 14px 16px; font-size: 15px; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  td, th { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  footer { padding: 30px 0 50px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--line); }
+  .theme { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 10px; padding: 4px 9px; margin-left: 14px; cursor: pointer; font-size: 14px; }
+  @media (max-width: 760px) {
+    .hero, .two { grid-template-columns: 1fr; }
+    .cards { grid-template-columns: 1fr; }
+    .devices { height: 260px; }
+    nav a.opt { display: none; }
+    nav a { margin-left: 12px; font-size: 14px; }
+    .theme { margin-left: 10px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 4C21 4 12 13 12 24c0 15 20 36 20 36s20-21 20-36C52 13 43 4 32 4z" fill="var(--accent)"/><circle cx="32" cy="24" r="8" fill="var(--surface)"/></svg>
+      iPhone Location
+    </div>
+    <nav>
+      <a class="opt" href="#modes">Modes</a>
+      <a class="opt" href="#how">How it works</a>
+      <a href="#start">Get started</a>
+      <a href="https://github.com/Anastasia-D-Kravchenko/iphone-location">GitHub</a>
+      <button class="theme" id="theme" aria-label="Toggle dark mode">◐</button>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <div>
+      <h1>Put your iPhone and Apple Watch anywhere on the map.</h1>
+      <p class="lead">An open-source app and Mac server that move the location of <b>your own</b> devices using Apple's
+        developer services — from a Mac, or with no Mac at all, even on mobile data.</p>
+      <div class="btns">
+        <a class="btn primary" href="#start">Get started</a>
+        <a class="btn ghost" href="https://github.com/Anastasia-D-Kravchenko/iphone-location">View on GitHub</a>
+      </div>
+    </div>
+    <div class="devices" aria-hidden="true">
+      <div class="phone"><div class="map"></div>
+        <svg class="pin" viewBox="0 0 64 64"><path d="M32 4C21 4 12 13 12 24c0 15 20 36 20 36s20-21 20-36C52 13 43 4 32 4z" fill="var(--accent)"/><circle cx="32" cy="24" r="8" fill="white"/></svg>
+      </div>
+      <div class="link"></div>
+      <div class="watch"><div class="map"></div>
+        <svg class="pin" viewBox="0 0 64 64" style="width:26px;height:26px"><path d="M32 4C21 4 12 13 12 24c0 15 20 36 20 36s20-21 20-36C52 13 43 4 32 4z" fill="var(--accent)"/><circle cx="32" cy="24" r="8" fill="white"/></svg>
+      </div>
+    </div>
+  </div>
+
+  <section id="modes">
+    <h2>Three ways to move</h2>
+    <div class="cards">
+      <div class="card"><span class="tag">Mac</span><h3>Mac server</h3>
+        <p>A small Python server and web page that call <code>devicectl</code>. iPhone and Watch, over cable or home Wi‑Fi. The iPhone app works as a remote.</p></div>
+      <div class="card"><span class="tag">No Mac</span><h3>This iPhone</h3>
+        <p>The app pairs with its own iPhone and opens a developer tunnel to itself through LocalDevVPN. Works away from home, on 5G.</p></div>
+      <div class="card"><span class="tag">No Mac</span><h3>iPhone + Watch + AirPods</h3>
+        <p>The app reaches the Watch over Bluetooth like a Mac does and moves both together. AirPods follow the iPhone they're connected to.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Made for everyday testing</h2>
+    <div class="cards">
+      <div class="card"><h3>Hold timer</h3><p>Pick 1 minute to 4 hours. The real location comes back by itself, even if the app is closed.</p></div>
+      <div class="card"><h3>Prolong or stop</h3><p>A notification a minute before the end: keep the fake 15 more minutes, or go back now.</p></div>
+      <div class="card"><h3>Free Apple ID</h3><p>Builds with a free account; a login agent re-signs and reinstalls the app before the 7 days run out.</p></div>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>How the Watch part works</h2>
+    <div class="two">
+      <ol class="flow">
+        <li><b>Bluetooth.</b> Connect to the Watch and open an L2CAP channel (PSM&nbsp;0x85) — the RemotePairing control channel.</li>
+        <li><b>Pair-verify</b> with the pairing made once from the Watch's Developer Mode screen, then ask for a tunnel listener.</li>
+        <li><b>Bonjour.</b> The Watch advertises <code>_rp-tunnel._tcp</code>; connect over Wi‑Fi or AWDL with Network.framework.</li>
+        <li><b>Tunnel.</b> TLS-PSK → CDTunnel → RemoteServiceDiscovery, via the <a href="https://github.com/jkcoxson/idevice">idevice</a> library.</li>
+        <li><b>Set location</b> with CoreDevice's location service — it stays after disconnecting. Done in about 3 seconds.</li>
+      </ol>
+      <div>
+        <p>Every step was found by watching what a Mac does when Xcode talks to a Watch, then doing the same from an iPhone app.
+          Dead ends and measurements are documented too: the Watch closes tunnels after ~8&nbsp;s, location simulation over
+          Instruments reverts on disconnect, and a Watch next to its iPhone takes the iPhone's location — so both are moved together.</p>
+        <p><a href="https://github.com/Anastasia-D-Kravchenko/iphone-location/blob/main/docs/how-it-works.md">Read the full write-up →</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>Get started</h2>
+    <div class="two">
+      <pre><code>git clone https://github.com/Anastasia-D-Kravchenko/iphone-location.git
+cd iphone-location/ios
+cp local.env.example local.env
+rustup target add aarch64-apple-ios
+Vendor/build_idevice.sh
+./build_install.sh</code></pre>
+      <table>
+        <tr><th>You need</th><th></th></tr>
+        <tr><td>iPhone</td><td>iOS 27, Developer Mode on</td></tr>
+        <tr><td>Apple Watch</td><td>watchOS 27, Developer Mode on (optional)</td></tr>
+        <tr><td>Mac</td><td>Xcode 26+, XcodeGen, Rust — to build once</td></tr>
+        <tr><td>No-Mac iPhone mode</td><td><a href="https://apps.apple.com/app/localdevvpn/id6755608044">LocalDevVPN</a></td></tr>
+      </table>
+    </div>
+    <p>Then follow the <a href="https://github.com/Anastasia-D-Kravchenko/iphone-location/blob/main/docs/setup.md">setup guide</a>:
+      trusting the developer profile, pairing the iPhone and the Watch, and the optional Mac server.</p>
+  </section>
+
+  <section>
+    <div class="note"><b>Use it responsibly.</b> Only on devices you own, for development and testing. Many apps — games, banking,
+      dating, workplace check-ins — forbid fake locations and may ban accounts. Don't use it to mislead people.</div>
+  </section>
+
+  <footer>
+    MIT License © 2026 Anastasia Kravchenko · Built on <a href="https://github.com/jkcoxson/idevice">idevice</a> and
+    <a href="https://github.com/ChrisMack32/Locus">Locus</a> (both MIT) · Not affiliated with Apple. Apple, iPhone, Apple Watch and AirPods are trademarks of Apple Inc.
+  </footer>
+</div>
+<script>
+  (function () {
+    var root = document.documentElement, btn = document.getElementById('theme');
+    try { var t = localStorage.getItem('theme'); if (t) root.setAttribute('data-theme', t); } catch (e) {}
+    btn.addEventListener('click', function () {
+      var dark = root.getAttribute('data-theme') === 'dark' ||
+        (!root.getAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+      var next = dark ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { localStorage.setItem('theme', next); } catch (e) {}
+    });
+  })();
+</script>
+</body>
+</html>
