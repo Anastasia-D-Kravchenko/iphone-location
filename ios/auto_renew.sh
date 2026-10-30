@@ -17,8 +17,21 @@ if [[ -n $expiry ]]; then
   left=$(( $(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$expiry" +%s) - $(date +%s) ))
 fi
 [[ -n ${FORCE:-} ]] && left=0
+# The app reschedules its "needs renewing" reminder only when it starts, so after a renewal it
+# has to be opened once, or the old reminder fires a day before the OLD expiry.
+# A locked iPhone refuses the launch, so keep retrying on later runs.
+PENDING=.launch_pending
+open_app() {
+  if xcrun devicectl device process launch --device $DEVICE $BUNDLE_ID >/dev/null 2>&1; then
+    rm -f $PENDING; say "opened the app (expiry reminder rescheduled)"
+  else
+    touch $PENDING; say "could not open the app (iPhone locked or away), will retry"
+  fi
+}
+
 if (( left > 48 * 3600 )); then
   say "ok, $(( left / 3600 )) h left (expires $expiry)"
+  [[ -f $PENDING ]] && open_app
   exit 0
 fi
 
@@ -44,6 +57,7 @@ done
 if NO_LAUNCH=1 ./build_install.sh >> $LOG 2>&1; then
   say "renewed"
   note "Renewed for 7 more days."
+  open_app
 else
   say "renew FAILED, see above"
   note "Automatic renewal failed. Run ios/build_install.sh with the iPhone plugged in."

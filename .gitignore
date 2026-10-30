@@ -22,3 +22,4 @@ ios/Vendor/idevice_backup_*/
 # Local copy of the Locus project (upstream: github.com/ChrisMack32/Locus)
 locus/
 NOTES.local.md
+ios/.launch_pending
