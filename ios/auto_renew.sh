@@ -35,10 +35,15 @@ if (( left > 48 * 3600 )); then
   exit 0
 fi
 
-if ! xcrun devicectl device info details --device $DEVICE 2>&1 | grep -q "Device State: connected"; then
-  # Ask CoreDevice to connect (works on the same Wi-Fi), then check again.
-  xcrun devicectl device info lockState --device $DEVICE >/dev/null 2>&1
-  if ! xcrun devicectl device info details --device $DEVICE 2>&1 | grep -q "Device State: connected"; then
+connected() { xcrun devicectl device info details --device $DEVICE 2>&1 | grep -q "Device State: connected"; }
+if ! connected; then
+  # Ask CoreDevice to connect (works on the same Wi-Fi); the Wi-Fi link takes a few seconds to come up.
+  for i in {1..6}; do
+    xcrun devicectl device info lockState --device $DEVICE >/dev/null 2>&1
+    connected && break
+    sleep 5
+  done
+  if ! connected; then
     say "needs renewal ($(( left / 3600 )) h left) but iPhone not reachable"
     (( left < 24 * 3600 )) && note "Expires in $(( left / 3600 )) h. Bring the iPhone home (Wi-Fi) or plug it in."
     exit 0
@@ -58,6 +63,9 @@ if NO_LAUNCH=1 ./build_install.sh >> $LOG 2>&1; then
   say "renewed"
   note "Renewed for 7 more days."
   open_app
+elif tail -40 $LOG | grep -q "No Accounts"; then
+  say "renew FAILED: Xcode is signed out of the Apple ID"
+  note "Can't renew: Xcode is signed out. Open Xcode > Settings > Accounts and sign in with your Apple ID."
 else
   say "renew FAILED, see above"
   note "Automatic renewal failed. Run ios/build_install.sh with the iPhone plugged in."
