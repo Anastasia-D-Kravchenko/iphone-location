@@ -1,6 +1,6 @@
 #!/bin/zsh
-# Run by a login agent (see README) every 6 hours.
-# Reinstalls the Location app (fresh 7-day free signing) when it expires in < 48 h
+# Run by a login agent (see README) every hour; renews only while the Mac is unlocked.
+# Reinstalls the Location app (fresh 7-day free signing) when it expires in < 72 h
 # and the iPhone is reachable (cable or same Wi-Fi). Otherwise does nothing.
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 cd "$(dirname "$0")"
@@ -29,9 +29,23 @@ open_app() {
   fi
 }
 
-if (( left > 48 * 3600 )); then
+signed_in() { defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists 2>/dev/null | grep -q 'identifier'; }
+is_locked() { ioreg -n Root -d1 | grep -q '"CGSSessionScreenIsLocked"=Yes'; }
+STAMP=.signed_out_warned
+if ! signed_in && ! is_locked && [[ -z $(find $STAMP -mmin -720 2>/dev/null) ]]; then
+  touch $STAMP
+  note "Xcode is signed out of your Apple ID. Open Xcode > Settings > Accounts and sign in, or the app stops working when it expires."
+fi
+if (( left > 72 * 3600 )); then
   say "ok, $(( left / 3600 )) h left (expires $expiry)"
   [[ -f $PENDING ]] && open_app
+  exit 0
+fi
+
+when() { (( left <= 0 )) && echo "Expired $(( -left / 3600 )) h ago" || echo "Expires in $(( left / 3600 )) h"; }
+if ! signed_in; then
+  say "needs renewal ($(( left / 3600 )) h left) but Xcode is signed out of the Apple ID"
+  (( left < 24 * 3600 )) && note "$(when). Xcode is signed out: open Xcode > Settings > Accounts and sign in with your Apple ID."
   exit 0
 fi
 
@@ -45,9 +59,14 @@ if ! connected; then
   done
   if ! connected; then
     say "needs renewal ($(( left / 3600 )) h left) but iPhone not reachable"
-    (( left < 24 * 3600 )) && note "Expires in $(( left / 3600 )) h. Bring the iPhone home (Wi-Fi) or plug it in."
+    (( left < 24 * 3600 )) && note "$(when). Bring the iPhone home (Wi-Fi) or plug it in."
     exit 0
   fi
+fi
+
+if is_locked; then
+  say "needs renewal ($(( left / 3600 )) h left) but the Mac is locked, will retry when unlocked"
+  exit 0
 fi
 
 say "renewing ($(( left / 3600 )) h left)"
@@ -63,6 +82,8 @@ if NO_LAUNCH=1 ./build_install.sh >> $LOG 2>&1; then
   say "renewed"
   note "Renewed for 7 more days."
   open_app
+elif tail -5 $LOG | grep -q "SCREEN_LOCKED"; then
+  say "skipped: the Mac locked just before the build, will retry"
 elif tail -40 $LOG | grep -q "No Accounts"; then
   say "renew FAILED: Xcode is signed out of the Apple ID"
   note "Can't renew: Xcode is signed out. Open Xcode > Settings > Accounts and sign in with your Apple ID."

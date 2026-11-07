@@ -29,6 +29,17 @@ chmod 600 LocationRemote/Config.swift
 
 [[ -f LocationRemote/Assets.xcassets/AppIcon.appiconset/icon.png ]] || python3 make_icon.py
 
+# Xcode 27 keeps the Apple ID in the data-protection keychain, which can't be read while the Mac
+# is locked; a signing build at that moment makes Xcode forget the account (lost 30.10, 06.11, 07.11).
+# So: never build while locked, keep the display awake during the build, one signing build at a time.
+if ioreg -n Root -d1 | grep -q '"CGSSessionScreenIsLocked"=Yes'; then
+  echo "SCREEN_LOCKED: the Mac is locked, not building (Xcode would drop the Apple ID)"; exit 3
+fi
+SIGN_LOCK="$HOME/Library/Caches/kravchenko-xcode-signing.lock"
+for i in {1..60}; do mkdir "$SIGN_LOCK" 2>/dev/null && break; sleep 10; done
+[[ -d $SIGN_LOCK ]] || { echo "another signing build is still running"; exit 4; }
+trap 'rmdir "$SIGN_LOCK" 2>/dev/null' EXIT
+caffeinate -d -i -w $$ &
 xcodegen generate --quiet
 xcodebuild -project LocationRemote.xcodeproj -scheme LocationRemote -configuration Release \
   -destination "id=$DEVICE" -derivedDataPath build -allowProvisioningUpdates -quiet build
