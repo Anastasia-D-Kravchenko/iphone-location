@@ -29,6 +29,9 @@ struct ContentView: View {
     @AppStorage("fakeAt") private var fakeAtText = ""
     @AppStorage("realAt") private var realAtText = ""
     @AppStorage("holdMinutes") private var holdMinutes = 15
+    /// "for" = a duration (holdMinutes), "until" = a clock time (endTime; only hour and minute count).
+    @AppStorage("holdMode") private var holdMode = "for"
+    @AppStorage("endTime") private var endTime = Date().addingTimeInterval(3600).timeIntervalSince1970
     @StateObject private var loc = LocationManager()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -46,10 +49,16 @@ struct ContentView: View {
     @State private var showDevices = false
     @State private var ignoreLocationUntil = Date.distantPast
     @State private var holdUntil: Date?
+    @State private var showEndPicker = false
+    /// The clock sheet changes the running fake (true) or only the setting for the next move (false).
+    @State private var endPickerForRunning = false
     @State private var serverHolds: [String: Hold] = [:]
     @FocusState private var searching: Bool
 
     private var api: API { API(host: host, token: token) }
+
+    private var untilMode: Bool { holdMode == "until" }
+    private var endClock: Date { Date(timeIntervalSince1970: endTime) }
 
     private var fakeAt: CLLocationCoordinate2D? {
         get { decode(fakeAtText) }
@@ -123,6 +132,15 @@ struct ContentView: View {
             DevicesSheet(devices: devices, selected: $selected, problem: statusOK ? nil : status) { await loadDevices() }
                 .presentationDetents([.medium, .large])
         }
+        .sheet(isPresented: $showEndPicker) {
+            EndTimeSheet(forRunning: endPickerForRunning,
+                         initial: endPickerForRunning ? (holdUntil ?? HoldStore.nextEnd(endClock)) : endClock) { picked in
+                endTime = picked.timeIntervalSince1970
+                holdMode = "until"
+                if endPickerForRunning { Task { await changeEnd(to: HoldStore.nextEnd(picked)) } }
+            }
+            .presentationDetents([.medium])
+        }
         .task {
             for s in DirectSession.all { await s.resume() }
             // Older installs saved only the home address; add Tailscale too.
@@ -140,6 +158,7 @@ struct ContentView: View {
             if scenePhase == .active { Task { await loadDevices(); await syncHolds() } }
         }
         .onChange(of: holdMinutes) { Reminder.registerButtons() }
+        .onChange(of: holdMode) { Reminder.registerButtons() }
         .onReceive(NotificationCenter.default.publisher(for: .holdChanged)) { _ in
             Task { await syncHolds() }
         }
@@ -289,26 +308,50 @@ struct ContentView: View {
     private var holdRow: some View {
         HStack(spacing: 10) {
             Menu {
-                Picker("Hold for", selection: $holdMinutes) {
-                    ForEach([0, 1, 5, 10, 15, 30, 60, 120, 240], id: \.self) { Text(holdLabel($0)).tag($0) }
+                Section("Keep the fake location for") {
+                    ForEach([0, 1, 5, 10, 15, 30, 60, 120, 240], id: \.self) { m in
+                        Button { holdMinutes = m; holdMode = "for" } label: {
+                            if !untilMode && holdMinutes == m {
+                                Label(holdLabel(m), systemImage: "checkmark")
+                            } else {
+                                Text(holdLabel(m))
+                            }
+                        }
+                    }
+                }
+                Section {
+                    Button { endPickerForRunning = false; showEndPicker = true } label: {
+                        Label(untilMode ? "Until \(endClock.formatted(date: .omitted, time: .shortened))…" : "Until a time…",
+                              systemImage: untilMode ? "checkmark" : "clock")
+                    }
                 }
             } label: {
-                Label("Hold: \(holdLabel(holdMinutes))", systemImage: "timer")
+                Label(untilMode ? "Until \(endClock.formatted(date: .omitted, time: .shortened))" : "Hold: \(holdLabel(holdMinutes))",
+                      systemImage: untilMode ? "clock" : "timer")
                     .font(.subheadline.weight(.medium))
             }
             Spacer()
             if fakeAt != nil {
                 if let until = holdUntil {
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        Text(timeLeft(until, now: context.date))
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundStyle(.orange)
+                    // Tap the countdown to pick a new end time on the clock.
+                    Button { endPickerForRunning = true; showEndPicker = true } label: {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            Text(timeLeft(until, now: context.date))
+                                .font(.subheadline.monospacedDigit())
+                                .foregroundStyle(.orange)
+                        }
                     }
+                    .buttonStyle(.plain)
+                    .disabled(busy)
                     Button("+\(holdLabel(HoldStore.prolongMinutes))") { Task { await prolong() } }
                         .buttonStyle(.bordered)
                         .disabled(busy)
                 } else {
-                    Text("Fake, no limit").font(.subheadline).foregroundStyle(.orange)
+                    Button { endPickerForRunning = true; showEndPicker = true } label: {
+                        Label("No limit · set end", systemImage: "clock").font(.subheadline)
+                    }
+                    .tint(.orange)
+                    .disabled(busy)
                 }
             }
         }
@@ -350,6 +393,24 @@ struct ContentView: View {
         await syncHolds()
         status = "Fake location kept \(holdLabel(HoldStore.prolongMinutes)) longer"
         statusOK = true
+    }
+
+    /// Moves the end of the fake that is running now to `end` (Mac devices and the no-Mac ones).
+    private func changeEnd(to end: Date) async {
+        busy = true
+        var errors: [String] = []
+        for id in HoldStore.devices {
+            do {
+                try await api.setUntil(id, until: end)
+            } catch {
+                errors.append("\(devices.first { $0.id == id }?.name ?? id): \(error.localizedDescription)")
+            }
+        }
+        for s in DirectSession.all where s.isActive { s.setUntil(end) }
+        busy = false
+        await syncHolds()
+        status = errors.isEmpty ? "Fake location now ends at \(endLabel(end)). Reminder 5 min before." : errors.joined(separator: "\n")
+        statusOK = errors.isEmpty
     }
 
     private func choose(_ c: CLLocationCoordinate2D, name: String) {
@@ -444,7 +505,9 @@ struct ContentView: View {
         guard let c = chosen else { return }
         status = "Moving…"
         statusOK = true
-        let minutes = holdMinutes
+        let minutes = untilMode
+            ? max(1, HoldStore.nextEnd(endClock).timeIntervalSinceNow / 60)
+            : Double(holdMinutes)
         let errors = await forSelected { d in
             if let s = DirectSession.session(for: d.id) {
                 try await s.move(to: c, minutes: minutes)
@@ -456,7 +519,7 @@ struct ContentView: View {
         if errors.isEmpty {
             let name = chosenName.isEmpty ? "the pin" : chosenName
             if let until = holdUntil {
-                status = "Moved to \(name). Real location back at \(until.formatted(date: .omitted, time: .shortened))"
+                status = "Moved to \(name). Real location back at \(endLabel(until))"
             } else {
                 status = "Moved to \(name), no time limit"
             }
@@ -483,6 +546,63 @@ struct ContentView: View {
             status = errors.joined(separator: "\n")
         }
         statusOK = errors.isEmpty
+    }
+}
+
+/// Pick on the clock until when the fake location stays. A time that has already passed today means tomorrow.
+struct EndTimeSheet: View {
+    let forRunning: Bool
+    let apply: (Date) -> Void
+    @State private var time: Date
+    @Environment(\.dismiss) private var dismiss
+
+    init(forRunning: Bool, initial: Date, apply: @escaping (Date) -> Void) {
+        self.forRunning = forRunning
+        self.apply = apply
+        _time = State(initialValue: initial)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                DatePicker("End time", selection: $time, displayedComponents: .hourAndMinute)
+                    .datePickerStyle(.wheel)
+                    .labelsHidden()
+
+                TimelineView(.periodic(from: .now, by: 15)) { context in
+                    let end = HoldStore.nextEnd(time, now: context.date)
+                    Text("Ends \(endLabel(end)) · in \(duration(end.timeIntervalSince(context.date)))")
+                        .font(.headline.monospacedDigit())
+                }
+
+                HStack {
+                    ForEach([30, 60, 120, 180], id: \.self) { m in
+                        Button("+\(holdLabel(m))") { time = Date().addingTimeInterval(Double(m) * 60) }
+                            .buttonStyle(.bordered)
+                    }
+                }
+                .font(.footnote)
+
+                Text("You get a notification 5 minutes before it ends, with buttons to keep it longer or stop now.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal)
+            .navigationTitle(forRunning ? "Change end time" : "Keep fake location until")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Set") { apply(time); dismiss() }.bold()
+                }
+            }
+        }
+    }
+
+    private func duration(_ seconds: TimeInterval) -> String {
+        let m = max(0, Int((seconds / 60).rounded(.up)))
+        return m >= 60 ? "\(m / 60) h \(m % 60) min" : "\(m) min"
     }
 }
 

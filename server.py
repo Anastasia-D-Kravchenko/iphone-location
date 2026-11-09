@@ -62,13 +62,23 @@ def expiry_loop():
                 save_holds()
 
 
-def run(args, timeout=90):
-    try:
-        p = subprocess.run(["xcrun", "devicectl", *args], capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, "devicectl timed out"
-    out = (p.stdout + p.stderr).strip()
-    return p.returncode == 0, out
+TRANSIENT = ("rejected the Bluetooth", "could not be established", "disconnected immediately")
+
+
+def run(args, timeout=90, retries=2):
+    # The first call after the iPhone wakes often fails while the Wi-Fi tunnel is still
+    # coming up; the same call a few seconds later works, so retry those errors.
+    for attempt in range(retries + 1):
+        try:
+            p = subprocess.run(["xcrun", "devicectl", *args], capture_output=True, text=True, timeout=timeout)
+            out = (p.stdout + p.stderr).strip()
+            ok = p.returncode == 0
+        except subprocess.TimeoutExpired:
+            ok, out = False, "devicectl timed out"
+        if ok or attempt == retries or not any(t in out for t in TRANSIENT):
+            return ok, out
+        print(f"devicectl retry {attempt + 1}: {out.splitlines()[-1] if out else ''}", file=sys.stderr)
+        time.sleep(3)
 
 
 def list_devices():
@@ -220,6 +230,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, {"ok": False, "error": "This device has no fake location now"})
                 # No minutes means "no limit"; otherwise add time to whatever is left.
                 hold["until"] = max(time.time(), hold.get("until") or time.time()) + minutes * 60 if minutes else None
+                hold.pop("retry_at", None)
+                save_holds()
+            ok, out = True, ""
+        elif self.path == "/api/until":
+            # Set the end to an exact clock time (unix seconds), earlier or later than now set.
+            try:
+                until = float(req["until"])
+            except (KeyError, TypeError, ValueError):
+                return self.send_json(400, {"ok": False, "error": "bad end time"})
+            if not (time.time() < until <= time.time() + 24 * 3600 + 60):
+                return self.send_json(200, {"ok": False, "error": "End time must be within the next 24 hours"})
+            with holds_lock:
+                hold = holds.get(device)
+                if not hold:
+                    return self.send_json(200, {"ok": False, "error": "This device has no fake location now"})
+                hold["until"] = until
                 hold.pop("retry_at", None)
                 save_holds()
             ok, out = True, ""

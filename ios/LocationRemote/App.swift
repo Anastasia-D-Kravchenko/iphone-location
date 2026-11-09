@@ -18,7 +18,7 @@ struct LocationRemoteApp: App {
                             do {
                                 if url.host == "watchset", let lat = Double(q["lat"] ?? ""), let lon = Double(q["lon"] ?? "") {
                                     try await DirectSession.watch.move(to: .init(latitude: lat, longitude: lon),
-                                                                       minutes: Int(q["min"] ?? "") ?? 5)
+                                                                       minutes: Double(q["min"] ?? "") ?? 5)
                                 } else {
                                     try await DirectSession.watch.stop()
                                 }

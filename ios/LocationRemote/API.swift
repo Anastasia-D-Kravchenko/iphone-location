@@ -122,7 +122,7 @@ struct API {
 
     /// Returns when the server will put the real location back (nil = no time limit).
     @discardableResult
-    func move(_ device: String, lat: Double, lon: Double, minutes: Int) async throws -> Date? {
+    func move(_ device: String, lat: Double, lon: Double, minutes: Double) async throws -> Date? {
         let reply: Reply = try await send(await request("/api/set", body: ["device": device, "lat": lat, "lon": lon, "minutes": minutes]))
         if !reply.ok { throw APIError.message(reply.error ?? "Failed") }
         return reply.until.map { Date(timeIntervalSince1970: $0) }
@@ -131,6 +131,14 @@ struct API {
     @discardableResult
     func extend(_ device: String, minutes: Int) async throws -> Date? {
         let reply: Reply = try await send(await request("/api/extend", body: ["device": device, "minutes": minutes]))
+        if !reply.ok { throw APIError.message(reply.error ?? "Failed") }
+        return reply.until.map { Date(timeIntervalSince1970: $0) }
+    }
+
+    /// Moves the end of a running fake to an exact time.
+    @discardableResult
+    func setUntil(_ device: String, until: Date) async throws -> Date? {
+        let reply: Reply = try await send(await request("/api/until", body: ["device": device, "until": until.timeIntervalSince1970]))
         if !reply.ok { throw APIError.message(reply.error ?? "Failed") }
         return reply.until.map { Date(timeIntervalSince1970: $0) }
     }

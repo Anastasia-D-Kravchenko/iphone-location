@@ -117,7 +117,7 @@ final class DirectSession: ObservableObject {
         }
     }
 
-    func move(to c: CLLocationCoordinate2D, minutes: Int) async throws {
+    func move(to c: CLLocationCoordinate2D, minutes: Double) async throws {
         guard hasPairingFile else { throw DirectError(target.pairFirst) }
         do {
             try await apply(c)
@@ -125,7 +125,7 @@ final class DirectSession: ObservableObject {
             throw target.explain(error)
         }
         fakeAt = c
-        until = minutes == 0 ? nil : Date().addingTimeInterval(Double(minutes) * 60)
+        until = minutes == 0 ? nil : Date().addingTimeInterval(minutes * 60)
         dropped = false
         startTimers()
         keeper.start()
@@ -135,6 +135,14 @@ final class DirectSession: ObservableObject {
     func extend(minutes: Int) {
         guard isActive, minutes > 0 else { return }
         until = max(Date(), until ?? Date()).addingTimeInterval(Double(minutes) * 60)
+        scheduleExpiry()
+        save()
+    }
+
+    /// Moves the end of a running fake to an exact time.
+    func setUntil(_ date: Date) {
+        guard isActive, date > Date() else { return }
+        until = date
         scheduleExpiry()
         save()
     }

@@ -12,8 +12,19 @@ enum HoldStore {
 
     /// The hold time picked in the app; 0 = no limit.
     static var minutes: Int { defaults.object(forKey: "holdMinutes") as? Int ?? 15 }
+    /// "Until a time" was picked instead of a duration.
+    static var untilMode: Bool { defaults.string(forKey: "holdMode") == "until" }
     /// How much "Prolong" adds.
-    static var prolongMinutes: Int { minutes == 0 ? 15 : minutes }
+    static var prolongMinutes: Int { untilMode || minutes == 0 ? 15 : minutes }
+
+    /// The next moment the clock shows the hour and minute of `clock`: today, or tomorrow if that has passed.
+    static func nextEnd(_ clock: Date, now: Date = Date()) -> Date {
+        let cal = Calendar.current
+        let hm = cal.dateComponents([.hour, .minute], from: clock)
+        var end = cal.date(bySettingHour: hm.hour ?? 0, minute: hm.minute ?? 0, second: 0, of: now) ?? now
+        if end <= now.addingTimeInterval(60) { end = cal.date(byAdding: .day, value: 1, to: end) ?? end }
+        return end
+    }
 
     static var devices: [String] {
         get { defaults.stringArray(forKey: "holdDevices") ?? [] }
@@ -29,6 +40,14 @@ enum HoldStore {
 func holdLabel(_ minutes: Int) -> String {
     if minutes == 0 { return "No limit" }
     return minutes < 60 ? "\(minutes) min" : "\(minutes / 60) h"
+}
+
+/// "18:30", or "Tue 07:00" when it isn't today.
+func endLabel(_ date: Date) -> String {
+    let time = date.formatted(date: .omitted, time: .shortened)
+    if Calendar.current.isDateInToday(date) { return time }
+    if Calendar.current.isDateInTomorrow(date) { return "tomorrow \(time)" }
+    return date.formatted(.dateTime.weekday(.abbreviated)) + " " + time
 }
 
 /// Local notifications: a warning before the real location comes back (with Prolong / Stop), and one when it does.
@@ -56,18 +75,19 @@ enum Reminder {
         guard let until else { return }
         let left = until.timeIntervalSinceNow
         guard left > 3 else { return }
-        let lead = left > 120 ? 60 : left / 2
+        // 5 minutes ahead; shorter holds get 1 minute, very short ones half the time.
+        let lead: TimeInterval = left > 600 ? 300 : left > 120 ? 60 : left / 2
 
         let warn = UNMutableNotificationContent()
-        warn.title = "Real location soon"
-        warn.body = (lead >= 60 ? "In 1 minute" : "In \(Int(lead)) seconds")
-            + " your devices show where you really are. Hold this notification to keep the fake location or stop now."
+        warn.title = "Fake location ends in " + (lead >= 60 ? "\(Int(lead / 60)) min" : "\(Int(lead)) s")
+        warn.body = "At \(endLabel(until)) your devices show where you really are again. "
+            + "Hold this notification to keep the fake location longer or stop it now."
         warn.sound = .default
         warn.categoryIdentifier = category
         add("hold-reminder", warn, after: left - lead)
 
         let end = UNMutableNotificationContent()
-        end.title = "Real location is back"
+        end.title = "Fake location ended"
         end.body = "Your devices show where you really are again."
         end.sound = .default
         add("hold-ended", end, after: left + 5)
